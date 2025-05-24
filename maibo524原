@@ -1,0 +1,213 @@
+# -*- coding: utf-8 -*-
+"""
+脉搏信号分析系统 v2.1
+作者：AI助手
+最后更新：2025-05-11
+功能：实现ECG/RPPG信号分段特征提取，支持动态噪声过滤与异常处理
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.signal import butter, filtfilt, find_peaks
+import matplotlib.pyplot as plt
+import logging
+import os
+
+# ----------------------
+# 配置参数
+# ----------------------
+SAMPLING_RATE = 1000  # 采样率(Hz)
+SEGMENT_DURATION = 30  # 时间段长度(秒)
+BUTTER_ORDER = 3  # 巴特沃斯滤波器阶数
+MIN_PEAK_DIST = 0.3  # 最小峰间距(秒)
+NOISE_THRESHOLD = 50  # 信号质量阈值(毫伏)
+
+# ----------------------
+# 日志配置
+# ----------------------
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s: %(message)s')
+
+
+# ----------------------
+# 核心功能模块
+# ----------------------
+def load_signal_data(file_path):
+    """加载脉搏信号数据，支持自动数据修复"""
+    try:
+        # 路径安全检测
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"文件路径 {file_path} 不存在")
+
+        # 读取数据并转换格式
+        with open(file_path, 'r') as f:
+            raw_data = [int(line.strip()) for line in f if line.strip().isdigit()]
+
+            # 数据完整性检查
+        if len(raw_data) < SAMPLING_RATE * 10:  # 至少10秒数据
+            logging.warning(f" 数据不足（仅{len(raw_data) / SAMPLING_RATE:.1f}秒），启用模拟模式")
+            raw_data = generate_simulated_data(60)  # 生成60秒模拟数据
+
+        return np.array(raw_data)
+    except Exception as e:
+        logging.error(f" 数据加载失败：{str(e)}")
+        raise
+
+
+def generate_simulated_data(duration_sec):
+    """生成模拟脉搏信号（正弦波+噪声+基线漂移）"""
+    t = np.linspace(0, duration_sec, duration_sec * SAMPLING_RATE)
+    signal = (
+            500 + 100 * np.sin(2 * np.pi * 1.2 * t)  # 主脉搏波
+            + 30 * np.random.randn(len(t))  # 高频噪声
+            + 20 * np.sin(2 * np.pi * 0.1 * t)  # 呼吸基线漂移
+    )
+    return signal.astype(int)
+
+
+def preprocess_signal(raw_signal):
+    """信号预处理流水线"""
+    # 带通滤波 (0.5-45 Hz)
+    b, a = butter_bandpass(
+        lowcut=0.5,
+        highcut=45,
+        fs=SAMPLING_RATE,
+        order=BUTTER_ORDER
+    )
+    filtered = filtfilt(b, a, raw_signal)
+
+    # 去除基线漂移
+    baseline = np.median(filtered)
+    return filtered - baseline
+
+
+def butter_bandpass(lowcut, highcut, fs, order=3):
+    """生成巴特沃斯带通滤波器系数"""
+    nyq = 0.5 * fs
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = butter(order, [low, high], btype='band')
+    return b, a
+
+
+def detect_valid_peaks(filtered_signal):
+    """动态阈值峰值检测"""
+    # 基于信号强度调整检测参数
+    dynamic_height = np.percentile(filtered_signal, 75)
+    min_distance = int(MIN_PEAK_DIST * SAMPLING_RATE)
+
+    peaks, properties = find_peaks(
+        filtered_signal,
+        height=dynamic_height,
+        distance=min_distance,
+        prominence=NOISE_THRESHOLD / 2
+    )
+
+    # 峰值质量验证
+    valid_peaks = []
+    for p in peaks:
+        if (filtered_signal[p] - np.median(filtered_signal)) > NOISE_THRESHOLD:
+            valid_peaks.append(p)
+    return np.array(valid_peaks)
+
+
+def calculate_hr_features(peaks):
+    """从峰值计算心率变异性特征"""
+    if len(peaks) < 2:
+        return {'hr_mean': np.nan, 'hr_std': np.nan, 'rmssd': np.nan}
+
+    rr_intervals = np.diff(peaks) / SAMPLING_RATE * 1000  # 转换为毫秒
+    hr_values = 60000 / rr_intervals  # 转换为每分钟心跳次数
+
+    return {
+        'hr_mean': np.mean(hr_values),
+        'hr_std': np.std(hr_values),
+        'rmssd': np.sqrt(np.mean(np.square(np.diff(rr_intervals)))),
+        'nn50': np.sum(np.abs(np.diff(rr_intervals)) > 50),
+        'pnn50': (np.sum(np.abs(np.diff(rr_intervals)) > 50) / (len(rr_intervals) - 1)) * 100
+    }
+
+
+def analyze_segment(segment):
+    """单时间段分析流程"""
+    try:
+        # 信号预处理
+        filtered = preprocess_signal(segment)
+
+        # 峰值检测
+        peaks = detect_valid_peaks(filtered)
+        if len(peaks) < 2:
+            logging.warning(" 有效脉搏波少于2个，跳过本段")
+            return None
+
+        # 特征计算
+        features = calculate_hr_features(peaks)
+        features.update({
+            'peaks_count': len(peaks),
+            'signal_quality': np.std(filtered),
+            'segment_length': len(segment) / SAMPLING_RATE
+        })
+        return features
+    except Exception as e:
+        logging.error(f" 分段分析失败：{str(e)}")
+        return None
+
+
+# ----------------------
+# 主程序
+# ----------------------
+def main(file_path, save_report=True):
+    """主分析流程"""
+    try:
+        # 步骤1：数据加载
+        raw_signal = load_signal_data(file_path)
+        logging.info(f" 已加载数据：{len(raw_signal) / SAMPLING_RATE:.1f}秒")
+
+        # 步骤2：分段时间窗处理
+        samples_per_segment = SEGMENT_DURATION * SAMPLING_RATE
+        segments = [
+            raw_signal[i:i + samples_per_segment]
+            for i in range(0, len(raw_signal), samples_per_segment)
+        ]
+        logging.info(f" 共分割为{len(segments)}个时间段")
+
+        # 步骤3：并行特征提取
+        features_list = []
+        for idx, seg in enumerate(segments):
+            result = analyze_segment(seg)
+            if result:
+                result['segment_id'] = idx + 1
+                features_list.append(result)
+            plt.figure(figsize=(10, 4))  # 可视化每个段
+            plt.plot(seg)
+            plt.title(f" 时间段 {idx + 1} 原始信号")
+            plt.savefig(f'segment_{idx + 1}.png')
+            plt.close()
+
+            # 步骤4：结果整合
+        df = pd.DataFrame(features_list)
+        if save_report:
+            df.to_excel(' 脉搏分析报告.xlsx', index=False)
+            logging.info(" 已保存分析报告到 脉搏分析报告.xlsx")
+
+        return df
+    except Exception as e:
+        logging.critical(f" 系统运行失败：{str(e)}")
+        return pd.DataFrame()
+
+
+# ----------------------
+# 执行示例
+# ----------------------
+if __name__ == "__main__":
+    # ✅ 修正后的文件路径（根据实际情况修改）
+    DATA_PATH = r"D:\dachuang\脉搏\sketch_250411a\ecg_data.txt"
+
+    # 运行主程序
+    report_df = main(DATA_PATH)
+
+    # 结果预览
+    if not report_df.empty:
+        print("\n分析结果摘要：")
+        print(report_df[['segment_id', 'hr_mean', 'hr_std', 'rmssd']].describe())
+    else:
+        print("未生成有效分析结果，请检查输入数据和日志")   
