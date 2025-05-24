@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler
 
 # 1. 加载各模态特征
 breath_df = pd.read_csv('breath_features.csv')
@@ -21,10 +20,14 @@ if fused_df.select_dtypes(include=['object']).shape[1] > 0:
     print("发现非数值列:", fused_df.select_dtypes(include=['object']).columns)
     fused_df = fused_df.select_dtypes(exclude=['object'])  # 移除字符串列
 
-# 5. 特征标准化
-scaler = StandardScaler()
-scaled_features = scaler.fit_transform(fused_df)
+# 5. 特征标准化（手动实现）
+def standardize_features(df):
+    standardized_df = (df - df.mean()) / df.std()
+    return standardized_df
 
-# 6. 保存融合后的特征
-np.save('fused_features.npy', scaled_features)
-print("融合后特征形状:", scaled_features.shape)
+scaled_features = standardize_features(fused_df)
+
+# 6. 保存融合后的特征为CSV文件
+scaled_features_df = pd.DataFrame(scaled_features, columns=fused_df.columns)
+scaled_features_df.to_csv('fused_features.csv', index=False)
+print("融合后特征已保存到 fused_features.csv 文件中。")
